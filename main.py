@@ -6,10 +6,25 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import logging
 
 # Constants and configs
-os_version_data = {
-        'Ubuntu': ['18.04', '20.04'],
+image_version_data = {
+        'Ubuntu': ['22.04', '20.04', '18.04', '16.04'],
         'Debian': ['9', '10'],
-        'Windows': ['10', '11']
+        'CentOS': ['8', '7'],
+        'Fedora': ['34', '33', '32', '31'],
+        'Arch': ['latest'],
+        'Alpine': ['3.14', '3.13', '3.12', '3.11'],
+        'Kali': ['latest'],
+        'Parrot': ['latest'],
+        'BlackArch': ['latest'],
+        'Ubuntu-Mate': ['latest'],
+        'Ubuntu-Studio': ['latest'],
+        'Lubuntu': ['latest'],
+        'Kubuntu': ['latest'],
+        'Xubuntu': ['latest'],
+        'Ubuntu-Budgie': ['latest'],
+        'Ubuntu-Kylin': ['latest'],
+        'Ubuntu-Unity': ['latest'],
+        'Ubuntu-DDE': ['latest'],
     }
 
 app = Flask(__name__)
@@ -34,7 +49,7 @@ containers = {}
 @app.route('/', methods=['GET', 'POST'])
 def index():
   if 'username' in session:
-    return render_template('index.html', os_version_data=os_version_data)
+    return render_template('index.html', image_version_data=image_version_data)
 
   if request.method == 'POST':
     username = request.form['username']
@@ -73,7 +88,7 @@ def start_container(data):
 
   logging.info(f'Request to start {full_image} container')
 
-  if image not in VALID_IMAGES or version not in VALID_IMAGES[image]:
+  if image not in image_version_data or version not in image_version_data[image]:
     logging.warning(f'Invalid container image: {full_image}')
     return
 
