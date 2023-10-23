@@ -1,13 +1,13 @@
 import docker
 import sqlite3
-from flask import Flask, render_template, request, session, redirect, url_for
-from flask_socketio import SocketIO
+from flask import Flask, render_template, request, session, redirect, url_for, session
+from flask_socketio import SocketIO, emit
 from werkzeug.security import generate_password_hash, check_password_hash
 import logging
 
 # Constants and configs
 image_version_data = {
-        'Ubuntu': ['22.04', '20.04', '18.04', '16.04'],
+        'python': ['latest'],
         'Debian': ['9', '10'],
         'CentOS': ['8', '7'],
         'Fedora': ['34', '33', '32', '31'],
@@ -28,8 +28,8 @@ image_version_data = {
     }
 
 app = Flask(__name__)
-app.secret_key = 'supersecretkey'  # Change this in production
-socketio = SocketIO(app)
+app.secret_key = 'supersecretkey'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 logging.basicConfig(level=logging.INFO)
 
@@ -44,44 +44,87 @@ conn.close()
 # Docker client
 client = docker.from_env()
 containers = {}
+authenticated_users = {}
 
+@socketio.on('authenticate')
+def handle_authenticate(data):
+    username = data.get('username')
+    password = data.get('password')
 
-@app.route('/', methods=['GET', 'POST'])
-def index():
-  if 'username' in session:
-    return render_template('index.html', image_version_data=image_version_data)
-
-  if request.method == 'POST':
-    username = request.form['username']
-    password = request.form['password']
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM users WHERE username = ?', (username, ))
     record = cursor.fetchone()
     conn.close()
-    if record and check_password_hash(record[1], password):
-      session['username'] = username
-      return redirect(url_for('index'))
-    conn.close()
-    
-  return render_template('login.html')
 
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = generate_password_hash(request.form['password'])
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, password))
-        conn.commit()
-        conn.close()
-        return redirect(url_for('index'))
-    return render_template('signup.html')
+    if record and check_password_hash(record[1], password):
+        authenticated_users[request.sid] = username
+        logging.info("Sending auth_status with data:", {
+                     'authenticated': True, 'username': username})
+        emit('auth_status', {'authenticated': True, 'username': username})
+    else:
+        logging.info("Sending auth_status with data:", {
+                     'authenticated': False})
+        emit('auth_status', {'authenticated': False})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    if request.sid in authenticated_users:
+        del authenticated_users[request.sid]
+
+@socketio.on('check_auth')
+def handle_check_auth():
+    if 'username' in session:
+        emit('auth_status', {'authenticated': True, 'username': session['username']})
+    else:
+        emit('auth_status', {'authenticated': False}, status=401)
+
+@socketio.on('signup')
+def handle_signup(data):
+    username = data['username']
+    password = data['password']
+    hashed_password = generate_password_hash(password)
+
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+
+    cursor.execute('INSERT INTO users (username, password) VALUES (?, ?)',(username, hashed_password))
+    conn.commit()
+    conn.close()
+
+    emit('signup_status', {'success': True})
+
+@socketio.on('login')
+def handle_login(data):
+    username = data['username']
+    password = data['password']
+
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
+    record = cursor.fetchone()
+    conn.close()
+
+    if record and check_password_hash(record[1], password):
+        emit('login_status', {'success': True, 'username': username})
+    else:
+        emit('login_status', {'success': False})
+
+@socketio.on('image_version_data')
+def handle_request_image_version_data():
+    emit('image_version_data', image_version_data)
+
+@socketio.on('get_active_containers')
+def get_active_containers():
+    session_id = request.sid
+    if session_id in containers:
+        emit('active_containers', containers[session_id])
 
 @socketio.on('start_container')
 def start_container(data):
-  image = data.get('image', '')
+  image = data.get('image', '').lower()
   version = data.get('version', '')
   session_id = request.sid
   full_image = f"{image}:{version}"
@@ -104,24 +147,35 @@ def start_container(data):
       f'Started {full_image} container: {container.id} for session: {session_id}')
   except Exception as e:
     logging.error(f'Failed to start container: {e}')
+  if session_id not in containers:
+      containers[session_id] = []
+  containers[session_id].append({
+      'id': container.id,
+      'image': image,
+      'version': version
+  })
+  emit('active_containers', containers[session_id])
 
 
 @socketio.on('stop_container')
-def stop_container():
-  session_id = request.sid
-
-  if session_id in containers:
-    try:
-      container = containers[session_id]
-      container.stop()
-      container.remove()
-      del containers[session_id]
-      logging.info(
-        f'Stopped and removed container: {container.id} for session: {session_id}')
-    except Exception as e:
-      logging.error(f'Failed to stop and remove container: {e}')
-  else:
-    logging.warning(f'No container found for session: {session_id}')
+def stop_container(data):
+    container_id = data.get('id', '')
+    session_id = request.sid
+    if session_id in containers:
+        for container_info in containers[session_id]:
+            if container_info['id'] == container_id:
+                try:
+                    container = client.containers.get(container_id)
+                    container.stop()
+                    container.remove()
+                    containers[session_id].remove(container_info)
+                    emit('active_containers', containers[session_id])
+                    logging.info(
+                        f'Stopped and removed container: {container.id} for session: {session_id}')
+                    return
+                except Exception as e:
+                    logging.error(f'Failed to stop and remove container: {e}')
+                    return
 
 
 if __name__ == '__main__':
